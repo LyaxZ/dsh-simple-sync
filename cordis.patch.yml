@@ -1,0 +1,4 @@
+# dsh-simple-sync bundle patch: one loader row.
+- insert:
+    - id: simple-sync
+      name: dsh-simple-sync
