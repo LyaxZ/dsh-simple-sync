@@ -177,3 +177,58 @@ test('sync units enumerated from profiles dir, not hardcoded', async (t) => {
   assert.ok(paths.includes('profiles/cli/package.json'));
   assert.ok(paths.includes('profiles/web/package.json'));
 });
+
+test('install failure rolls back profile config so DSH stays bootable', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dss-p1-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const homeA = await makeHomeA(root);
+  const homeB = join(root, 'homeB');
+  await mkdir(homeB, { recursive: true });
+
+  // B already runs a working profile with OLD bundles
+  const oldPkg = JSON.stringify({
+    name: 'dsh-profile-web', private: true,
+    dependencies: { 'dsh-default': '^1.0.0' },
+    dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', 'dsh-default'] } },
+  }, null, 2);
+  await mkdir(join(homeB, 'profiles', 'web'), { recursive: true });
+  await writeFile(join(homeB, 'profiles', 'web', 'package.json'), oldPkg);
+  await writeFile(join(homeB, 'profiles', 'web', 'cordis.patch.yml'), '- id: old\n');
+
+  // pnpm missing entirely
+  const failRunner = async () => { throw new Error('should not be called'); };
+  const snap = await buildSnapshot(homeA);
+  const report = await applySnapshot(snap, homeB, {
+    run: failRunner,
+    resolveExecutable: async () => { throw new Error('pnpm not found'); },
+  });
+
+  assert.equal(report.depsFailed.length, 1);
+  assert.equal(report.depsFailed[0].profile, 'web');
+  assert.match(report.depsFailed[0].error, /pnpm 未找到/);
+  assert.ok(report.reverted.length === 1);
+  assert.ok(report.reverted[0].files.some((x) => x.includes('package.json')));
+
+  // package.json restored to the OLD bundle list (no dsh-scholar)
+  const pkgAfter = JSON.parse(await readFile(join(homeB, 'profiles', 'web', 'package.json'), 'utf8'));
+  assert.ok(pkgAfter.dependencies['dsh-default'], 'old bundle kept');
+  assert.ok(!pkgAfter.dependencies['dsh-scholar'], 'new bundle rolled back');
+  const patchAfter = await readFile(join(homeB, 'profiles', 'web', 'cordis.patch.yml'), 'utf8');
+  assert.ok(patchAfter.includes('old'), 'patch rolled back');
+});
+
+test('pnpm errors surface the real reason', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dss-p1-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const home = join(root, 'home');
+  await mkdir(join(home, 'profiles', 'web'), { recursive: true });
+  await writeFile(join(home, 'profiles', 'web', 'package.json'), '{"name":"p","private":true,"dependencies":{}}\n');
+
+  const failRunner = async () => { throw new Error('pnpm: ERR_PNPM_FETCH_404 GET https://registry.npmjs.org/xxx'); };
+  const snap = { meta: { machine: 'A', time: new Date().toISOString(), unitVersion: 1 }, files: [
+    { path: 'profiles/web/package.json', sha256: 'a'.repeat(64), content: '{"name":"p","private":true,"dependencies":{"dsh-x":"^1.0.0"}}\n' },
+  ] };
+  const report = await applySnapshot(snap, home, { run: failRunner, resolveExecutable: async () => 'pnpm' });
+  assert.equal(report.depsFailed.length, 1);
+  assert.match(report.depsFailed[0].error, /ERR_PNPM_FETCH_404/, 'real pnpm error text surfaced');
+});
