@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   buildSnapshot, diffSnapshot, applySnapshot, loadState, saveState,
-  listSyncUnits, parseInsertNames,
+  listSyncUnits, parseInsertNames, pnpmCommand,
 } from '../lib/ops.js';
 
 const WEB_PKG = JSON.stringify({
@@ -45,7 +45,7 @@ function fakeRunner() {
     calls,
     async run(argv, cwd, opts) {
       calls.push({ argv, cwd });
-      if (argv[0] === 'pnpm' && argv.includes('--frozen-lockfile')) {
+      if (argv.join(' ').includes('pnpm') && argv.join(' ').includes('--frozen-lockfile')) {
         throw new Error('lockfile drift (simulated)');
       }
       return { out: '', err: '' };
@@ -92,7 +92,7 @@ test('one-click move: apply snapshot to an empty home', async (t) => {
   assert.equal(report.restartHint, true);
 
   // pnpm install attempted (frozen fails → plain fallback)
-  const pnpmCalls = runner.calls.filter((c) => c.argv[0] === 'pnpm');
+  const pnpmCalls = runner.calls.filter((c) => c.argv.join(' ').includes('pnpm'));
   assert.ok(pnpmCalls.length >= 2, 'expected frozen + plain install attempts');
   assert.ok(pnpmCalls.some((c) => c.cwd.endsWith(join('profiles', 'web'))));
   assert.deepEqual(report.depsInstalled, ['web']);
@@ -243,7 +243,7 @@ test('insert-referenced plugins auto-install on a fresh machine', async (t) => {
   const calls = [];
   const runner = async (argv, cwd, opts) => {
     calls.push(argv.join(' '));
-    if (argv[0] === 'pnpm' && argv[1] === 'add') return { out: '', err: '' };
+    if (argv.join(' ').includes('pnpm add')) return { out: '', err: '' };
     if (argv.includes('--frozen-lockfile')) throw new Error('no lockfile (simulated)');
     return { out: '', err: '' };
   };
@@ -258,7 +258,7 @@ test('insert-referenced plugins auto-install on a fresh machine', async (t) => {
 
   assert.ok(report.autoInstalled.some((x) => x.includes('dsh-quick-toc')), 'quick-toc auto-installed');
   assert.ok(report.autoInstalled.some((x) => x.includes('dsh-simple-sync')), 'simple-sync auto-installed');
-  const adds = calls.filter((c) => c.startsWith('pnpm add'));
+  const adds = calls.filter((c) => c.includes('pnpm add'));
   assert.ok(adds.some((c) => c.includes('dsh-quick-toc')));
   assert.ok(adds.some((c) => c.includes('dsh-simple-sync')));
   assert.equal(report.depsFailed.length, 0, 'no failures');
@@ -304,4 +304,50 @@ test('parseInsertNames handles block and repeated inserts', () => {
   ].join('\n');
   const names = parseInsertNames(yaml);
   assert.deepEqual(names.sort(), ['dsh-quick-toc', 'dsh-simple-sync']);
+});
+
+test('pnpmCommand wraps .cmd shims through cmd.exe on Windows', () => {
+  const argv = pnpmCommand('C:\\Users\\x\\AppData\\Roaming\\npm\\pnpm.cmd', ['install', '--frozen-lockfile']);
+  if (process.platform === 'win32') {
+    assert.equal(argv[0], 'cmd.exe');
+    assert.equal(argv[1], '/d');
+    assert.equal(argv[2], '/s');
+    assert.equal(argv[3], '/c');
+    assert.match(argv[4], /pnpm\.cmd.*install.*--frozen-lockfile/);
+    // path with spaces gets quoted
+    const spaced = pnpmCommand('C:\\my tools\\pnpm.cmd', ['install']);
+    assert.match(spaced[4], /^"C:\\my tools\\pnpm\.cmd" install$/);
+  } else {
+    assert.equal(argv[0], 'C:\\Users\\x\\AppData\\Roaming\\npm\\pnpm.cmd');
+  }
+});
+
+test('rollback guarantees the sync plugin stays loadable', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dss-p1-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const home = join(root, 'home');
+  const profileDir = join(home, 'profiles', 'web');
+  await mkdir(profileDir, { recursive: true });
+  // pre-pull state: plain package.json WITHOUT simple-sync, patch WITHOUT insert
+  await writeFile(join(profileDir, 'package.json'), '{"name":"p","private":true,"dependencies":{}}\n');
+  await writeFile(join(profileDir, 'cordis.patch.yml'), '- id: scholar\n  config: {}\n');
+
+  const failRunner = async () => { throw new Error('boom'); };
+  const snap = {
+    meta: { machine: 'A', time: new Date().toISOString(), unitVersion: 1 },
+    files: [
+      { path: 'profiles/web/package.json', sha256: 'f'.repeat(64), content: '{"name":"p","private":true,"dependencies":{"dsh-memory":"^0.1.0"}}\n' },
+      { path: 'profiles/web/cordis.patch.yml', sha256: 'g'.repeat(64), content: '- insert:\n    - id: simple-sync\n      name: dsh-simple-sync\n' },
+    ],
+  };
+  const report = await applySnapshot(snap, home, {
+    run: failRunner,
+    resolveExecutable: async () => 'pnpm',
+  });
+  assert.equal(report.depsFailed.length, 1);
+  // the rollback restored the OLD patch — but the sync insert must be re-added
+  const patch = await readFile(join(profileDir, 'cordis.patch.yml'), 'utf8');
+  assert.ok(patch.includes('simple-sync'), 'sync plugin insert re-added after rollback');
+  const pkg = JSON.parse(await readFile(join(profileDir, 'package.json'), 'utf8'));
+  assert.ok(!pkg.dependencies['dsh-memory'], 'bundle list rolled back');
 });
