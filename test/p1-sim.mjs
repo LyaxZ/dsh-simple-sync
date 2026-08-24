@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   buildSnapshot, diffSnapshot, applySnapshot, loadState, saveState,
-  listSyncUnits,
+  listSyncUnits, parseInsertNames,
 } from '../lib/ops.js';
 
 const WEB_PKG = JSON.stringify({
@@ -231,4 +231,77 @@ test('pnpm errors surface the real reason', async (t) => {
   const report = await applySnapshot(snap, home, { run: failRunner, resolveExecutable: async () => 'pnpm' });
   assert.equal(report.depsFailed.length, 1);
   assert.match(report.depsFailed[0].error, /ERR_PNPM_FETCH_404/, 'real pnpm error text surfaced');
+});
+
+test('insert-referenced plugins auto-install on a fresh machine', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dss-p1-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const homeB = join(root, 'homeB');
+  await mkdir(join(homeB, 'profiles', 'web'), { recursive: true });
+  await writeFile(join(homeB, 'profiles', 'web', 'package.json'), '{"name":"p","private":true,"dependencies":{}}\n');
+
+  const calls = [];
+  const runner = async (argv, cwd, opts) => {
+    calls.push(argv.join(' '));
+    if (argv[0] === 'pnpm' && argv[1] === 'add') return { out: '', err: '' };
+    if (argv.includes('--frozen-lockfile')) throw new Error('no lockfile (simulated)');
+    return { out: '', err: '' };
+  };
+  const snap = {
+    meta: { machine: 'A', time: new Date().toISOString(), unitVersion: 1 },
+    files: [
+      { path: 'profiles/web/package.json', sha256: 'b'.repeat(64), content: '{"name":"p","private":true,"dependencies":{"dsh-memory":"^0.1.0"}}\n' },
+      { path: 'profiles/web/cordis.patch.yml', sha256: 'c'.repeat(64), content: '# patch\n- insert:\n    - id: quick-toc\n      name: dsh-quick-toc\n- insert:\n    - id: simple-sync\n      name: dsh-simple-sync\n' },
+    ],
+  };
+  const report = await applySnapshot(snap, homeB, { run: runner, resolveExecutable: async () => 'pnpm' });
+
+  assert.ok(report.autoInstalled.some((x) => x.includes('dsh-quick-toc')), 'quick-toc auto-installed');
+  assert.ok(report.autoInstalled.some((x) => x.includes('dsh-simple-sync')), 'simple-sync auto-installed');
+  const adds = calls.filter((c) => c.startsWith('pnpm add'));
+  assert.ok(adds.some((c) => c.includes('dsh-quick-toc')));
+  assert.ok(adds.some((c) => c.includes('dsh-simple-sync')));
+  assert.equal(report.depsFailed.length, 0, 'no failures');
+});
+
+test('already-installed insert plugins are left alone', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dss-p1-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const homeB = join(root, 'homeB');
+  await mkdir(join(homeB, 'profiles', 'web', 'node_modules', 'dsh-quick-toc'), { recursive: true });
+  await writeFile(join(homeB, 'profiles', 'web', 'package.json'), '{"name":"p","private":true,"dependencies":{}}\n');
+
+  const calls = [];
+  const runner = async (argv, cwd, opts) => {
+    calls.push(argv.join(' '));
+    if (argv[1] === 'add') return { out: '', err: '' };
+    if (argv.includes('--frozen-lockfile')) throw new Error('no lockfile');
+    return { out: '', err: '' };
+  };
+  const snap = {
+    meta: { machine: 'A', time: new Date().toISOString(), unitVersion: 1 },
+    files: [
+      { path: 'profiles/web/package.json', sha256: 'd'.repeat(64), content: '{"name":"p","private":true,"dependencies":{}}\n' },
+      { path: 'profiles/web/cordis.patch.yml', sha256: 'e'.repeat(64), content: '- insert:\n    - id: quick-toc\n      name: dsh-quick-toc\n' },
+    ],
+  };
+  const report = await applySnapshot(snap, homeB, { run: runner, resolveExecutable: async () => 'pnpm' });
+  assert.equal(report.autoInstalled.length, 0, 'nothing auto-installed');
+  assert.ok(!calls.some((c) => c.includes('pnpm add')), 'no pnpm add ran');
+});
+
+test('parseInsertNames handles block and repeated inserts', () => {
+  const yaml = [
+    '# scholar config',
+    '- id: scholar',
+    '  config: { proxy: "" }',
+    '- insert:',
+    '    - id: quick-toc',
+    '      name: dsh-quick-toc',
+    '- insert:',
+    '    - id: simple-sync',
+    '      name: dsh-simple-sync',
+  ].join('\n');
+  const names = parseInsertNames(yaml);
+  assert.deepEqual(names.sort(), ['dsh-quick-toc', 'dsh-simple-sync']);
 });
