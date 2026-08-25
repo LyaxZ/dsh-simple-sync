@@ -185,11 +185,12 @@ test('install failure rolls back profile config so DSH stays bootable', async (t
   const homeB = join(root, 'homeB');
   await mkdir(homeB, { recursive: true });
 
-  // B already runs a working profile with OLD bundles
+  // B already runs a working profile with OLD bundles (a SUBSET of A's — so
+  // the downgrade guard does not trip; the rollback logic is what we test)
   const oldPkg = JSON.stringify({
     name: 'dsh-profile-web', private: true,
     dependencies: { 'dsh-default': '^1.0.0' },
-    dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', 'dsh-default'] } },
+    dsh: { profile: { bundles: ['@deepseek-ai/dsh-base'] } },
   }, null, 2);
   await mkdir(join(homeB, 'profiles', 'web'), { recursive: true });
   await writeFile(join(homeB, 'profiles', 'web', 'package.json'), oldPkg);
@@ -350,4 +351,58 @@ test('rollback guarantees the sync plugin stays loadable', async (t) => {
   assert.ok(patch.includes('simple-sync'), 'sync plugin insert re-added after rollback');
   const pkg = JSON.parse(await readFile(join(profileDir, 'package.json'), 'utf8'));
   assert.ok(!pkg.dependencies['dsh-memory'], 'bundle list rolled back');
+});
+
+test('downgrade guard: refuses snapshots that remove local plugins', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dss-p1-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const home = join(root, 'home');
+  await mkdir(join(home, 'profiles', 'web'), { recursive: true });
+  // local machine HAS many plugins
+  const localPkg = JSON.stringify({
+    name: 'p', private: true,
+    dependencies: { 'dsh-memory': '^0.1.0', 'dsh-scholar': '^0.1.0', 'dsh-skin': '^1.0.0' },
+    dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', 'dsh-memory', 'dsh-scholar', 'dsh-skin'] } },
+  }, null, 2);
+  await writeFile(join(home, 'profiles', 'web', 'package.json'), localPkg);
+
+  // incoming snapshot has FEWER bundles (bad laptop state)
+  const snap = {
+    meta: { machine: 'LAPTOP-BAD', time: new Date().toISOString(), unitVersion: 1 },
+    files: [
+      { path: 'profiles/web/package.json', sha256: 'h'.repeat(64), content: '{"name":"p","private":true,"dependencies":{},"dsh":{"profile":{"bundles":["@deepseek-ai/dsh-base","@deepseek-ai/dsh-web-app"]}}}\n' },
+    ],
+  };
+  const runner = async () => { throw new Error('should not install'); };
+  const report = await applySnapshot(snap, home, { run: runner, resolveExecutable: async () => 'pnpm' });
+  assert.ok(report.refused && report.refused.length === 1, 'refused downgrade');
+  assert.equal(report.written.length, 0, 'nothing written');
+  assert.ok(report.refused[0].missing.includes('dsh-memory'));
+  // local file untouched
+  const after = await readFile(join(home, 'profiles', 'web', 'package.json'), 'utf8');
+  assert.equal(after, localPkg, 'local package.json untouched');
+});
+
+test('install skipped when no NEW dependencies are added', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dss-p1-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const home = join(root, 'home');
+  await mkdir(join(home, 'profiles', 'web'), { recursive: true });
+  await writeFile(join(home, 'profiles', 'web', 'package.json'), '{"name":"p","private":true,"dependencies":{"dsh-memory":"^0.1.0"}}\n');
+
+  let installRan = false;
+  const runner = async (argv) => {
+    if (argv.join(' ').includes('pnpm install')) installRan = true;
+    return { out: '', err: '' };
+  };
+  // same deps, different version spec — no NEW packages → no install → no prune
+  const snap = {
+    meta: { machine: 'A', time: new Date().toISOString(), unitVersion: 1 },
+    files: [
+      { path: 'profiles/web/package.json', sha256: 'i'.repeat(64), content: '{"name":"p","private":true,"dependencies":{"dsh-memory":"^0.2.0"}}\n' },
+    ],
+  };
+  const report = await applySnapshot(snap, home, { run: runner, resolveExecutable: async () => 'pnpm' });
+  assert.equal(installRan, false, 'no pnpm install for equal deps');
+  assert.equal(report.depsInstalled.length, 0);
 });
