@@ -405,6 +405,34 @@ test('downgrade guard: refuses snapshots that remove local plugins', async (t) =
   assert.equal(after, localPkg, 'local package.json untouched');
 });
 
+test('downgrade guard allows plugins covered by incoming patch inserts', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dss-p1-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const home = join(root, 'home');
+  const profileDir = join(home, 'profiles', 'web');
+  await mkdir(profileDir, { recursive: true });
+  // laptop: `dsh plugin add` put simple-sync in local bundles
+  await writeFile(join(profileDir, 'package.json'), '{"name":"p","private":true,"dependencies":{},"dsh":{"profile":{"bundles":["@deepseek-ai/dsh-base","dsh-simple-sync"]}}}\n');
+  // incoming: simple-sync NOT in bundles, but the incoming PATCH inserts it
+  const runner = async (argv, cwd) => {
+    const joined = argv.join(' ');
+    if (joined.includes('pnpm add')) return { out: '', err: '' };
+    if (joined.includes('--frozen-lockfile')) throw new Error('no lockfile');
+    await materializeDeps(cwd);
+    return { out: '', err: '' };
+  };
+  const snap = {
+    meta: { machine: 'A', time: new Date().toISOString(), unitVersion: 1 },
+    files: [
+      { path: 'profiles/web/package.json', sha256: 'q'.repeat(64), content: '{"name":"p","private":true,"dependencies":{},"dsh":{"profile":{"bundles":["@deepseek-ai/dsh-base"]}}}\n' },
+      { path: 'profiles/web/cordis.patch.yml', sha256: 'r'.repeat(64), content: '- insert:\n    - id: simple-sync\n      name: dsh-simple-sync\n' },
+    ],
+  };
+  const report = await applySnapshot(snap, home, { run: runner, resolveExecutable: async (n) => n });
+  assert.ok(!report.refused, 'not refused — insert covers the plugin');
+  assert.ok(report.written.length > 0, 'apply proceeded past the guard');
+});
+
 test('install skipped when no NEW dependencies are added', async (t) => {
   const root = await mkdtemp(join(tmpdir(), 'dss-p1-'));
   t.after(() => rm(root, { recursive: true, force: true }));
