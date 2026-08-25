@@ -339,9 +339,9 @@ test('pnpmCommand wraps .cmd shims through cmd.exe on Windows', () => {
     assert.match(argv[4], /pnpm\.cmd.*install.*--frozen-lockfile/);
     // path with spaces gets quoted
     const spaced = pnpmCommand('C:\\my tools\\pnpm.cmd', ['install']);
-    // cmd /s /c strips outer quotes — the leading quote is doubled so the
-    // quoted spaced path survives: ""C:\my tools\pnpm.cmd" install"
-    assert.match(spaced[4], /^""C:\\my tools\\pnpm\.cmd" install"$/);
+    // bin and args stay separate argv elements after /c — Node quotes the
+    // spaced path, cmd runs it without quote-stripping games
+    assert.deepEqual(spaced, ['cmd.exe', '/d', '/c', 'C:\\my tools\\pnpm.cmd', 'install']);
   } else {
     assert.equal(argv[0], 'C:\\Users\\x\\AppData\\Roaming\\npm\\pnpm.cmd');
   }
