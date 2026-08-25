@@ -1,4 +1,4 @@
-﻿{
+{
   "name": "dsh-simple-sync",
   "version": "0.1.9",
   "description": "Simple config sync for DeepSeek Harness: one-click move and auto-sync plugin list, configs, settings and presets across machines",
