@@ -507,3 +507,70 @@ test('post-apply verification rolls back when install did not materialize', asyn
   const pkg = JSON.parse(await readFile(join(profileDir, 'package.json'), 'utf8'));
   assert.ok(!pkg.dependencies['dsh-memory'], 'package.json rolled back');
 });
+
+test('install falls back to npm when pnpm fails (CN network)', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dss-p1-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const home = join(root, 'home');
+  const profileDir = join(home, 'profiles', 'web');
+  await mkdir(profileDir, { recursive: true });
+  await writeFile(join(profileDir, 'package.json'), '{"name":"p","private":true,"dependencies":{}}\n');
+
+  const calls = [];
+  const runner = async (argv, cwd) => {
+    calls.push(argv.join(' '));
+    const joined = argv.join(' ');
+    if (joined.includes('pnpm')) throw new Error('pnpm: UND_ERR_DESTROYED (simulated)');
+    if (joined.includes('npm')) {
+      await materializeDeps(cwd);
+      return { out: '', err: '' };
+    }
+    return { out: '', err: '' };
+  };
+  const snap = {
+    meta: { machine: 'A', time: new Date().toISOString(), unitVersion: 1 },
+    files: [
+      { path: 'profiles/web/package.json', sha256: 'n'.repeat(64), content: '{"name":"p","private":true,"dependencies":{"dsh-memory":"^0.1.0"},"dsh":{"profile":{"bundles":["dsh-memory"]}}}\n' },
+    ],
+  };
+  const report = await applySnapshot(snap, home, { run: runner, resolveExecutable: async (n) => n });
+  assert.ok(calls.some((c) => c.includes('pnpm')), 'pnpm attempted first');
+  assert.ok(calls.some((c) => c.includes('npm')), 'npm fallback used');
+  assert.equal(report.depsInstalled.length, 1, 'install succeeded via npm');
+  assert.equal(report.depsFailed.length, 0, 'no failures');
+  assert.equal(report.reverted.length, 0, 'no rollback');
+});
+
+test('orphan plugin install falls back to npm too', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dss-p1-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const home = join(root, 'home');
+  const profileDir = join(home, 'profiles', 'web');
+  await mkdir(profileDir, { recursive: true });
+  await writeFile(join(profileDir, 'package.json'), '{"name":"p","private":true,"dependencies":{}}\n');
+
+  const calls = [];
+  const runner = async (argv, cwd) => {
+    calls.push(argv.join(' '));
+    const joined = argv.join(' ');
+    if (joined.includes('pnpm')) throw new Error('pnpm: UND_ERR_DESTROYED');
+    if (joined.includes('npm install ')) {
+      const m = joined.match(/npm install\s+([\w@./-]+)/);
+      if (m) await mkdir(join(cwd, 'node_modules', ...m[1].split('/')), { recursive: true });
+      return { out: '', err: '' };
+    }
+    await materializeDeps(cwd);
+    return { out: '', err: '' };
+  };
+  const snap = {
+    meta: { machine: 'A', time: new Date().toISOString(), unitVersion: 1 },
+    files: [
+      { path: 'profiles/web/package.json', sha256: 'o'.repeat(64), content: '{"name":"p","private":true,"dependencies":{}}\n' },
+      { path: 'profiles/web/cordis.patch.yml', sha256: 'p'.repeat(64), content: '- insert:\n    - id: quick-toc\n      name: dsh-quick-toc\n' },
+    ],
+  };
+  const report = await applySnapshot(snap, home, { run: runner, resolveExecutable: async (n) => n });
+  assert.ok(calls.some((c) => c.includes('npm install dsh-quick-toc')), 'npm fallback for orphan');
+  assert.ok(report.autoInstalled.some((x) => x.includes('dsh-quick-toc')), 'orphan auto-installed');
+  assert.equal(report.depsFailed.length, 0);
+});
