@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   buildSnapshot, diffSnapshot, applySnapshot, loadState, saveState,
-  listSyncUnits, parseInsertNames, pnpmCommand,
+  listSyncUnits, parseInsertNames, pnpmCommand, validateLocalProfile,
 } from '../lib/ops.js';
 
 const WEB_PKG = JSON.stringify({
@@ -39,6 +39,18 @@ async function makeHomeA(root) {
   return home;
 }
 
+async function materializeDeps(profileDir) {
+  try {
+    const pkg = JSON.parse(await readFile(join(profileDir, 'package.json'), 'utf8'));
+    const deps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
+    for (const name of Object.keys(deps)) {
+      await mkdir(join(profileDir, 'node_modules', ...name.split('/')), { recursive: true });
+    }
+  } catch {
+    // no package.json — nothing to materialize
+  }
+}
+
 function fakeRunner() {
   const calls = [];
   return {
@@ -48,6 +60,8 @@ function fakeRunner() {
       if (argv.join(' ').includes('pnpm') && argv.join(' ').includes('--frozen-lockfile')) {
         throw new Error('lockfile drift (simulated)');
       }
+      // simulate a successful install: create node_modules for declared deps
+      await materializeDeps(cwd);
       return { out: '', err: '' };
     },
   };
@@ -244,8 +258,15 @@ test('insert-referenced plugins auto-install on a fresh machine', async (t) => {
   const calls = [];
   const runner = async (argv, cwd, opts) => {
     calls.push(argv.join(' '));
-    if (argv.join(' ').includes('pnpm add')) return { out: '', err: '' };
+    const joined = argv.join(' ');
+    if (joined.includes('pnpm add')) {
+      // simulate pnpm add: create the package in node_modules
+      const m = joined.match(/pnpm add\s+([\w@./-]+)/);
+      if (m) await mkdir(join(cwd, 'node_modules', ...m[1].split('/')), { recursive: true });
+      return { out: '', err: '' };
+    }
     if (argv.includes('--frozen-lockfile')) throw new Error('no lockfile (simulated)');
+    await materializeDeps(cwd);
     return { out: '', err: '' };
   };
   const snap = {
@@ -275,8 +296,9 @@ test('already-installed insert plugins are left alone', async (t) => {
   const calls = [];
   const runner = async (argv, cwd, opts) => {
     calls.push(argv.join(' '));
-    if (argv[1] === 'add') return { out: '', err: '' };
+    if (argv.join(' ').includes('pnpm add')) return { out: '', err: '' };
     if (argv.includes('--frozen-lockfile')) throw new Error('no lockfile');
+    await materializeDeps(cwd);
     return { out: '', err: '' };
   };
   const snap = {
@@ -387,7 +409,7 @@ test('install skipped when no NEW dependencies are added', async (t) => {
   const root = await mkdtemp(join(tmpdir(), 'dss-p1-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const home = join(root, 'home');
-  await mkdir(join(home, 'profiles', 'web'), { recursive: true });
+  await mkdir(join(home, 'profiles', 'web', 'node_modules', 'dsh-memory'), { recursive: true });
   await writeFile(join(home, 'profiles', 'web', 'package.json'), '{"name":"p","private":true,"dependencies":{"dsh-memory":"^0.1.0"}}\n');
 
   let installRan = false;
@@ -405,4 +427,83 @@ test('install skipped when no NEW dependencies are added', async (t) => {
   const report = await applySnapshot(snap, home, { run: runner, resolveExecutable: async () => 'pnpm' });
   assert.equal(installRan, false, 'no pnpm install for equal deps');
   assert.equal(report.depsInstalled.length, 0);
+});
+
+test('apply refuses a snapshot whose bundle is missing from dependencies', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dss-p1-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const home = join(root, 'home');
+  await mkdir(join(home, 'profiles', 'web'), { recursive: true });
+  await writeFile(join(home, 'profiles', 'web', 'package.json'), '{"name":"p","private":true,"dependencies":{}}\n');
+
+  const runner = async () => { throw new Error('should not install'); };
+  // bundle dsh-magic is NOT in dependencies → cannot be installed on target
+  const snap = {
+    meta: { machine: 'A', time: new Date().toISOString(), unitVersion: 1 },
+    files: [
+      { path: 'profiles/web/package.json', sha256: 'j'.repeat(64), content: '{"name":"p","private":true,"dependencies":{},"dsh":{"profile":{"bundles":["dsh-magic"]}}}\n' },
+    ],
+  };
+  const report = await applySnapshot(snap, home, { run: runner, resolveExecutable: async () => 'pnpm' });
+  assert.ok(report.invalid && report.invalid.length === 1, 'invalid snapshot refused');
+  assert.ok(report.invalid[0].errors.some((e) => e.includes('dsh-magic')));
+  assert.equal(report.written.length, 0, 'nothing written');
+});
+
+test('apply refuses duplicate bundle+insert ids', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dss-p1-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const home = join(root, 'home');
+  await mkdir(join(home, 'profiles', 'web'), { recursive: true });
+  await writeFile(join(home, 'profiles', 'web', 'package.json'), '{"name":"p","private":true,"dependencies":{}}\n');
+
+  const runner = async () => { throw new Error('should not install'); };
+  const snap = {
+    meta: { machine: 'A', time: new Date().toISOString(), unitVersion: 1 },
+    files: [
+      { path: 'profiles/web/package.json', sha256: 'k'.repeat(64), content: '{"name":"p","private":true,"dependencies":{"dsh-x":"^1.0.0"},"dsh":{"profile":{"bundles":["dsh-x"]}}}\n' },
+      { path: 'profiles/web/cordis.patch.yml', sha256: 'l'.repeat(64), content: '- insert:\n    - id: x\n      name: dsh-x\n' },
+    ],
+  };
+  const report = await applySnapshot(snap, home, { run: runner, resolveExecutable: async () => 'pnpm' });
+  assert.ok(report.invalid && report.invalid.length === 1, 'duplicate refused');
+  assert.ok(report.invalid[0].errors.some((e) => e.includes('同时')));
+});
+
+test('push-side validation flags missing local plugins', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dss-p1-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const home = join(root, 'home');
+  const nm = join(home, 'profiles', 'web', 'node_modules');
+  await mkdir(nm, { recursive: true });
+  await writeFile(join(home, 'profiles', 'web', 'package.json'), '{"name":"p","private":true,"dependencies":{"dsh-memory":"^0.1.0"},"dsh":{"profile":{"bundles":["dsh-memory","dsh-ghost"]}}}\n');
+  // dsh-memory present, dsh-ghost MISSING from node_modules
+  await mkdir(join(nm, 'dsh-memory'), { recursive: true });
+  const errors = await validateLocalProfile(home, 'web');
+  assert.ok(errors.some((e) => e.includes('dsh-ghost')), 'missing plugin flagged');
+  assert.ok(!errors.some((e) => e.includes('dsh-memory')), 'present plugin not flagged');
+});
+
+test('post-apply verification rolls back when install did not materialize', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dss-p1-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const home = join(root, 'home');
+  const profileDir = join(home, 'profiles', 'web');
+  await mkdir(profileDir, { recursive: true });
+  await writeFile(join(profileDir, 'package.json'), '{"name":"p","private":true,"dependencies":{}}\n');
+
+  // fake runner claims success but does NOT create node_modules entries
+  const runner = async () => ({ out: '', err: '' });
+  const snap = {
+    meta: { machine: 'A', time: new Date().toISOString(), unitVersion: 1 },
+    files: [
+      { path: 'profiles/web/package.json', sha256: 'm'.repeat(64), content: '{"name":"p","private":true,"dependencies":{"dsh-memory":"^0.1.0"},"dsh":{"profile":{"bundles":["dsh-memory"]}}}\n' },
+    ],
+  };
+  const report = await applySnapshot(snap, home, { run: runner, resolveExecutable: async () => 'pnpm' });
+  // install "succeeded" but dsh-memory is not in node_modules → verification fails → rollback
+  assert.ok(report.depsFailed.some((d) => /应用后验证失败/.test(d.error)), 'verification failure reported');
+  assert.ok(report.reverted.length >= 1, 'rolled back');
+  const pkg = JSON.parse(await readFile(join(profileDir, 'package.json'), 'utf8'));
+  assert.ok(!pkg.dependencies['dsh-memory'], 'package.json rolled back');
 });
